@@ -18,13 +18,24 @@ import {
   Encryption,
   PrivateKey,
   Group,
+  Reducer,
+  Struct,
 } from 'snarkyjs';
 
 import { ChannelBalanceProof } from './channelBalanceProof.js';
 
+class CollateralUpdateEvent extends Struct({
+  player: PublicKey,
+  updateValue: Field,
+  witness: MerkleMapWitness,
+}) {}
+
 export class Executor extends SmartContract {
   @state(Field) merkleMapRoot = State<Field>();
   @state(PublicKey) oraclePublicKey = State<PublicKey>();
+  @state(Field) actionsHash = State<Field>();
+
+  reducer = Reducer({ actionType: CollateralUpdateEvent });
 
   deploy(args: DeployArgs) {
     super.deploy(args);
@@ -78,9 +89,13 @@ export class Executor extends SmartContract {
     depositUpdate.send({ to: this.address, amount: new UInt64(amount) });
     depositUpdate.requireSignature();
 
-    let witnessRoot: Field;
-    witnessRoot = witness.computeRootAndKey(previousCollateral.add(amount))[0];
-    this.merkleMapRoot.set(witnessRoot);
+    const collateralUpdateEvent = new CollateralUpdateEvent({
+      player: player,
+      updateValue: amount,
+      witness: witness,
+    });
+
+    this.reducer.dispatch(collateralUpdateEvent);
   }
 
   /*
@@ -122,9 +137,42 @@ export class Executor extends SmartContract {
 
     this.send({ to: player, amount: withdrawAmount });
 
-    let witnessRoot: Field;
-    witnessRoot = witness.computeRootAndKey(Field(0))[0];
-    this.merkleMapRoot.set(witnessRoot);
+    const collateralUpdateEvent = new CollateralUpdateEvent({
+      player: player,
+      updateValue: withdrawAmount.value,
+      witness: witness,
+    });
+
+    this.reducer.dispatch(collateralUpdateEvent);
+  }
+
+  @method
+  reduceCollateralActions() {
+    let collateralRoot = this.merkleMapRoot.get();
+    this.merkleMapRoot.assertEquals(collateralRoot);
+
+    let actionsHash = this.actionsHash.get();
+    this.actionsHash.assertEquals(actionsHash);
+
+    let pendingActions = this.reducer.getActions({
+      fromActionHash: actionsHash,
+    });
+
+    let { state: newRoot, actionsHash: newActionsHash } = this.reducer.reduce(
+      pendingActions,
+      // state type
+      Field,
+      // function that says how to apply an action
+      (state: Field, action: CollateralUpdateEvent) => {
+        return action.witness.computeRootAndKey(action.updateValue)[0];
+      },
+      // initial values for the reducer
+      { state: collateralRoot, actionsHash }
+    );
+
+    // update on-chain state
+    this.merkleMapRoot.set(newRoot);
+    this.actionsHash.set(newActionsHash);
   }
 
   /*
